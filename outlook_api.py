@@ -27,6 +27,55 @@ class OutlookReader:
             ) from e
         self.state_file = "state.json"
 
+    def _resolver_pasta(self, nome_pasta: str):
+        """
+        Localiza a pasta pelo nome, em qualquer nível sob a raiz da conta (irmãs da Inbox e subpastas).
+        Só examina pastas sob o pai da Caixa de Entrada (árvore usual da conta).
+        """
+        inbox = self.namespace.GetDefaultFolder(6)  # olFolderInbox
+        nome_alvo = (nome_pasta or "").strip().lower()
+        if not nome_alvo:
+            return inbox
+
+        def procurar_recursivo(pasta):
+            try:
+                if pasta.Name.strip().lower() == nome_alvo:
+                    return pasta
+            except Exception:
+                pass
+            try:
+                subs = pasta.Folders
+                for i in range(1, subs.Count + 1):
+                    sub = subs.Item(i)
+                    achado = procurar_recursivo(sub)
+                    if achado is not None:
+                        return achado
+            except Exception:
+                pass
+            return None
+
+        try:
+            raiz_conta = inbox.Parent
+            alvo = procurar_recursivo(raiz_conta)
+            if alvo is not None:
+                try:
+                    logger.info(
+                        "Pasta '%s' encontrada: %s",
+                        nome_pasta,
+                        getattr(alvo, "FolderPath", alvo.Name),
+                    )
+                except Exception:
+                    logger.info("Pasta '%s' encontrada.", nome_pasta)
+                return alvo
+        except Exception as e:
+            logger.warning("Erro ao percorrer a árvore de pastas: %s", e)
+
+        logger.warning(
+            "Pasta '%s' não encontrada na conta; usando a Caixa de Entrada padrão.",
+            nome_pasta,
+        )
+        return inbox
+
     def _ler_watermark(self) -> datetime:
         """
         Lê a última data/hora salva em state.json.
@@ -58,49 +107,47 @@ class OutlookReader:
         """
         Busca e-mails recebidos após a última leitura registrada no state.json.
         """
-        pasta_ref = None
-        for folder in self.namespace.GetDefaultFolder(6).Parent.Folders:
-            if folder.Name.lower() == nome_pasta.lower():
-                pasta_ref = folder
-                break
-                
-        if pasta_ref is None:
-            pasta_ref = self.namespace.GetDefaultFolder(6)  # Fallback para Inbox padrão
+        pasta_ref = self._resolver_pasta(nome_pasta)
 
         ultima_lida = self._ler_watermark()
-        filtro = ""
-        if ultima_lida:
-            # O Outlook prefere o formato de data local ou dd/mm/yyyy HH:MM para filtros COM
-            dt_str = ultima_lida.strftime("%d/%m/%Y %H:%M:%S")
-            filtro = f"[ReceivedTime] > '{dt_str}'"
-            
-        emails = pasta_ref.Items
-        if filtro:
-            emails = emails.Restrict(filtro)
-            
-        # False = Ascending (Do mais antigo para o mais novo)
-        emails.Sort("[ReceivedTime]", False) 
+
+        try:
+            itens = pasta_ref.Items
+            # True = ordem decrescente (mais recente primeiro): varremos até passar o watermark.
+            # Evita Restrict com string de data, que em muitos Outlooks/locales não retorna itens.
+            itens.Sort("[ReceivedTime]", True)
+        except Exception as e:
+            logger.error("Falha ao ordenar itens da pasta: %s", e)
+            raise
 
         resultados: List[Dict[str, Any]] = []
-        
-        for item in emails:
-            # Class == 43 garante que o item é um E-mail real (ignora convites de calendário, alertas, etc)
-            if item.Class == 43: 
-                # Conversão segura do pywintypes.datetime para datetime do Python
-                raw_date = item.ReceivedTime
-                dt_recebimento = datetime(
-                    raw_date.year, raw_date.month, raw_date.day,
-                    raw_date.hour, raw_date.minute, raw_date.second
-                )
-                
-                resultados.append({
+
+        for item in itens:
+            if getattr(item, "Class", None) != 43:
+                continue
+            raw_date = item.ReceivedTime
+            dt_recebimento = datetime(
+                raw_date.year,
+                raw_date.month,
+                raw_date.day,
+                raw_date.hour,
+                raw_date.minute,
+                raw_date.second,
+            )
+            if dt_recebimento <= ultima_lida:
+                break
+
+            resultados.append(
+                {
                     "assunto": item.Subject,
-                    "remetente": item.SenderName,  # SenderName é mais seguro que Sender.Name
+                    "remetente": item.SenderName,
                     "data_recebimento": dt_recebimento,
                     "entry_id": getattr(item, "EntryID", None) or "",
                     "objeto_email": item,
-                })
-                
+                }
+            )
+
+        resultados.reverse()
         return resultados
 
     def atualizar_cursor(self, nova_data: Union[datetime, str]) -> None:

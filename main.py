@@ -10,7 +10,7 @@ from excel_manager import ExcelManager, ArquivoBloqueadoError
 from logger_config import logger
 
 # Configurações globais
-NOME_PASTA_OUTLOOK = "Ouvidoria"
+NOME_PASTA_OUTLOOK = "Ouvidoria_Teste"
 HORAS_SLA = 24  # SLA de 24 horas úteis por chamado
 INTERVALO_MINUTOS = 10  # Tempo entre ciclos, em minutos
 
@@ -49,12 +49,14 @@ def rotina_sincronizacao():
         data_ultimo = emails[-1]['data_recebimento']
         outlook.atualizar_cursor(data_ultimo)
         logger.info(f"Sincronização finalizada. {len(dados_para_excel)} chamados processados e cursor atualizado.")
+        print(f"Sincronização finalizada. {len(dados_para_excel)} chamados processados e cursor atualizado.")
     except ArquivoBloqueadoError as e:
         logger.warning(f"Não foi possível salvar porque o arquivo está aberto: {e}")
         # Não avança o cursor, para tentar novamente no próximo ciclo
         return
     except Exception as e:
         logger.error(f"Erro inesperado ao salvar chamados ou atualizar cursor: {e}")
+        print(f"Erro inesperado ao salvar chamados ou atualizar cursor: {e}")
         return
 
 def criar_icone():
@@ -93,7 +95,7 @@ def main():
         item("Sincronizar Agora", acao_sincronizar_manual),
         item("Sair", acao_sair)
     )
-    icone = pystray.Icon("OuvidoriaBot", criar_icone(), "Ouvidoria Robot - Ativo", menu=menu)
+    icone = pystray.Icon("OuvidoriaBot", criar_icone(), "Outlook Manager Robot - Ativo", menu=menu)
     logger.info("Sistema da Ouvidoria carregado. O ícone foi iniciado na bandeja do sistema.")
     icone.run()
 
