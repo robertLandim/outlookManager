@@ -1,0 +1,17 @@
+[outlook]
+folder_name = "Ouvidoria_Teste"
+
+[sla]
+hours = 24
+
+[sync]
+interval_minutes = 10
+
+[paths]
+spreadsheet = "Controle_Ouvidoria.xlsx"
+state_file = "state.json"
+pending_file = "pending_chamados.json"
+
+[notifications]
+enabled = true
+blocked_debounce_minutes = 10

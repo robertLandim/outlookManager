@@ -1,23 +1,31 @@
-import os
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 
-# Certifique-se de que a pasta "logs" existe
-LOG_DIR = "logs"
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
+from config import APP_ROOT
 
-LOG_FILE = os.path.join(LOG_DIR, "outlook_manager.log")
+LOG_DIR = APP_ROOT / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Configuração do handler com rotação, encoding utf-8
+LOG_FILE = LOG_DIR / "outlook_manager.log"
+
 handler = RotatingFileHandler(
-    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    str(LOG_FILE), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
 )
 
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s - %(message)s')
+formatter = logging.Formatter(
+    "%(asctime)s - %(levelname)s - %(filename)s - %(message)s"
+)
 handler.setFormatter(formatter)
 
 logger = logging.getLogger("outlook_manager")
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
-logger.propagate = False  # Para evitar logs duplicados ao importar em outros módulos
+logger.propagate = False
+
+if os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes"):
+    _console = logging.StreamHandler()
+    _console.setFormatter(formatter)
+    _console.setLevel(logging.DEBUG)
+    logger.addHandler(_console)
+    logger.setLevel(logging.DEBUG)

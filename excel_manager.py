@@ -1,15 +1,45 @@
-from typing import List, Dict
+from __future__ import annotations
+
 import os
+import shutil
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict
+
 import pandas as pd
+
 from logger_config import logger
+
 
 class ArquivoBloqueadoError(Exception):
     """Exceção customizada para indicar que o arquivo Excel está bloqueado para escrita."""
     pass
 
+
+class ExcelReadError(Exception):
+    """Falha ao ler o Excel existente; gravação abortada para evitar perda de dados."""
+    pass
+
+
 class ExcelManager:
-    def __init__(self, caminho_arquivo: str = "Controle_Ouvidoria.xlsx") -> None:
-        self.caminho_arquivo = caminho_arquivo
+    def __init__(self, caminho_arquivo: str | Path) -> None:
+        self.caminho_arquivo = str(Path(caminho_arquivo))
+
+    def _backup_corrupt_file(self, exc: Exception) -> None:
+        src = Path(self.caminho_arquivo)
+        if not src.is_file():
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bak = src.with_name(f"{src.stem}_readerror_{stamp}{src.suffix}.bak")
+        try:
+            shutil.copy2(src, bak)
+            logger.error(
+                "Cópia de segurança do Excel criada em '%s' após erro de leitura: %s",
+                bak,
+                exc,
+            )
+        except OSError as copy_err:
+            logger.error("Não foi possível copiar o Excel para backup: %s", copy_err)
 
     def salvar_chamados(self, lista_dados: List[Dict]) -> None:
         """
@@ -33,8 +63,12 @@ class ExcelManager:
             try:
                 df_existente = pd.read_excel(self.caminho_arquivo)
             except Exception as e:
-                logger.error(f"Erro ao ler o arquivo Excel existente: {e}")
-                df_existente = pd.DataFrame(columns=colunas)
+                self._backup_corrupt_file(e)
+                logger.error("Erro ao ler o arquivo Excel existente: %s", e)
+                raise ExcelReadError(
+                    f"Não foi possível ler '{self.caminho_arquivo}'. "
+                    "Foi criada uma cópia .bak se possível; a gravação foi abortada."
+                ) from e
             for c in colunas:
                 if c not in df_existente.columns:
                     df_existente[c] = pd.NA
@@ -43,20 +77,21 @@ class ExcelManager:
             id_col = 'ID Mensagem'
             mask = df_pronto[id_col].notna() & (df_pronto[id_col].astype(str).str.strip() != '')
             if mask.any():
-                df_pronto = df_pronto.drop_duplicates(subset=[id_col], keep='first')
+                df_pronto = df_pronto.drop_duplicates(subset=[id_col], keep='last')
 
         try:
             df_pronto.to_excel(self.caminho_arquivo, index=False)
-            logger.info(f"{len(lista_dados)} chamados salvos em '{self.caminho_arquivo}'.")
+            logger.info("%s chamados salvos em '%s'.", len(lista_dados), self.caminho_arquivo)
         except PermissionError:
             logger.warning(
-                f"Arquivo '{self.caminho_arquivo}' está bloqueado para escrita. "
-                "Feche o arquivo no Excel para continuar."
+                "Arquivo '%s' está bloqueado para escrita. "
+                "Feche o arquivo no Excel para continuar.",
+                self.caminho_arquivo,
             )
             raise ArquivoBloqueadoError(
                 f"O arquivo '{self.caminho_arquivo}' está aberto em outro programa. "
                 "Não foi possível salvar os dados."
             )
         except Exception as e:
-            logger.error(f"Erro inesperado ao salvar o Excel: {e}")
+            logger.error("Erro inesperado ao salvar o Excel: %s", e)
             raise

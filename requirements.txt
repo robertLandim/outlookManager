@@ -1,0 +1,9 @@
+# Instalação: pip install -r requirements.txt
+# Python 3.11+ recomendado.
+
+pywin32>=306,<312
+pandas>=3.0.2,<4
+openpyxl>=3.1.5,<4
+pystray>=0.19.5,<0.20
+Pillow>=10,<12
+winotify>=1.1,<2

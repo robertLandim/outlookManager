@@ -4,16 +4,31 @@ import os
 import json
 from typing import List, Dict, Any, Union
 
+
+def write_watermark(state_file: str, nova_data: datetime) -> None:
+    """Grava state.json no mesmo formato do OutlookReader (sem usar COM)."""
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {"ultima_leitura": nova_data.strftime("%Y-%m-%d %H:%M:%S")},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
 class OutlookReader:
     """
     Classe robusta para automação do Outlook Desktop via COM Automation.
     Garante leitura incremental de e-mails utilizando controle de Watermark baseado em data/hora persistida em arquivo local.
     """
 
-    def __init__(self):
+    def __init__(self, state_file: str | None = None):
         """
         Inicializa a conexão com a API MAPI do Outlook. 
         Caso o Outlook não esteja aberto, uma exceção amigável é lançada.
+
+        Args:
+            state_file: Caminho do arquivo de watermark (state.json). Padrão: state.json no CWD.
         """
         try:
             import win32com.client
@@ -25,7 +40,7 @@ class OutlookReader:
             raise RuntimeError(
                 "Não foi possível conectar ao Outlook. Certifique-se de que o Outlook Desktop está aberto e logado."
             ) from e
-        self.state_file = "state.json"
+        self.state_file = state_file or "state.json"
 
     def _resolver_pasta(self, nome_pasta: str):
         """
@@ -100,8 +115,7 @@ class OutlookReader:
         """
         Salva a data/hora mais recente lida no arquivo state.json.
         """
-        with open(self.state_file, "w", encoding="utf-8") as f:
-            json.dump({"ultima_leitura": nova_data.strftime("%Y-%m-%d %H:%M:%S")}, f, ensure_ascii=False, indent=2)
+        write_watermark(self.state_file, nova_data)
 
     def buscar_novos_emails(self, nome_pasta: str = "Inbox") -> List[Dict[str, Any]]:
         """

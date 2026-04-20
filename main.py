@@ -1,103 +1,181 @@
+"""
+Robô de bandeja: lê e-mails no Outlook (pasta configurável), calcula SLA e grava em Excel.
+
+Operação: manter o Outlook Desktop aberto e logado; fechar a planilha no Excel quando o robô
+precisar gravar (logs em logs/outlook_manager.log ao lado deste projeto).
+"""
+
+from __future__ import annotations
+
 import threading
-import time
+
 import pystray
 from pystray import MenuItem as item
 from PIL import Image, ImageDraw
 
-from outlook_api import OutlookReader
-from sla_engine import calcular_prazo_sla
-from excel_manager import ExcelManager, ArquivoBloqueadoError
+from config import abs_path_under_root, load_config
+from excel_manager import ArquivoBloqueadoError, ExcelManager, ExcelReadError
 from logger_config import logger
+from notifications_win import notify_excel_blocked
+from outlook_api import OutlookReader, write_watermark
+from pending_store import (
+    clear_pending,
+    load_pending,
+    max_data_chegada,
+    merge_by_message_id,
+    save_pending,
+)
+from sla_engine import calcular_prazo_sla
 
-# Configurações globais
-NOME_PASTA_OUTLOOK = "Ouvidoria_Teste"
-HORAS_SLA = 24  # SLA de 24 horas úteis por chamado
-INTERVALO_MINUTOS = 10  # Tempo entre ciclos, em minutos
+# Evento para “Sincronizar agora” (mesma thread do worker COM)
+_manual_sync: threading.Event | None = None
 
-def rotina_sincronizacao():
-    logger.info("Iniciando rotina de sincronização do sistema Ouvidoria...")
-    outlook = OutlookReader()
-    excel = ExcelManager()
 
+def _run_sync_cycle(cfg: dict) -> None:
+    paths = cfg["paths"]
+    state_path = abs_path_under_root(paths["state_file"])
+    spreadsheet_path = abs_path_under_root(paths["spreadsheet"])
+    pending_path = abs_path_under_root(paths["pending_file"])
+    nome_pasta = cfg["outlook"]["folder_name"]
+    horas_sla = int(cfg["sla"]["hours"])
+    notif = cfg["notifications"]
+
+    logger.info("Iniciando ciclo de sincronização da Ouvidoria...")
+    pending_rows = load_pending(pending_path)
+
+    emails: list = []
     try:
-        emails = outlook.buscar_novos_emails(nome_pasta=NOME_PASTA_OUTLOOK)
-    except Exception as e:
-        logger.error(f"Falha ao buscar emails: {e}")
-        return
+        _outlook = OutlookReader(str(state_path))
+        emails = _outlook.buscar_novos_emails(nome_pasta=nome_pasta)
+    except RuntimeError as e:
+        logger.error("Falha ao conectar ao Outlook: %s", e)
+        if not pending_rows:
+            return
 
-    if not emails:
-        logger.info("Nenhum novo e-mail encontrado na rotina. Aguardando próximo ciclo.")
-        return
-
-    dados_para_excel = []
+    dados_novos = []
     for mail in emails:
         try:
-            prazo_sla = calcular_prazo_sla(mail['data_recebimento'], HORAS_SLA)
-        except Exception as e:
-            logger.error(f"Erro ao calcular SLA para o e-mail '{mail}': {e}")
-            prazo_sla = ""  # Armazena string vazia, ou pode 'continue' (option)
-        dados_para_excel.append({
-            "Assunto": mail.get("assunto", ""),
-            "Remetente": mail.get("remetente", ""),
-            "Data Chegada": mail.get("data_recebimento", ""),
-            "Prazo SLA": prazo_sla,
-            "ID Mensagem": mail.get("entry_id", "") or "",
-        })
-    try:
-        excel.salvar_chamados(dados_para_excel)
-        # Atualiza o cursor (data última processada)
-        data_ultimo = emails[-1]['data_recebimento']
-        outlook.atualizar_cursor(data_ultimo)
-        logger.info(f"Sincronização finalizada. {len(dados_para_excel)} chamados processados e cursor atualizado.")
-        print(f"Sincronização finalizada. {len(dados_para_excel)} chamados processados e cursor atualizado.")
-    except ArquivoBloqueadoError as e:
-        logger.warning(f"Não foi possível salvar porque o arquivo está aberto: {e}")
-        # Não avança o cursor, para tentar novamente no próximo ciclo
-        return
-    except Exception as e:
-        logger.error(f"Erro inesperado ao salvar chamados ou atualizar cursor: {e}")
-        print(f"Erro inesperado ao salvar chamados ou atualizar cursor: {e}")
+            prazo_sla = calcular_prazo_sla(mail["data_recebimento"], horas_sla)
+        except Exception as ex:
+            logger.error("Erro ao calcular SLA para o e-mail %s: %s", mail, ex)
+            prazo_sla = ""
+        dados_novos.append(
+            {
+                "Assunto": mail.get("assunto", ""),
+                "Remetente": mail.get("remetente", ""),
+                "Data Chegada": mail.get("data_recebimento", ""),
+                "Prazo SLA": prazo_sla,
+                "ID Mensagem": mail.get("entry_id", "") or "",
+            }
+        )
+
+    if not emails and not pending_rows:
+        logger.info("Nenhum e-mail novo e nada pendente. Aguardando próximo ciclo.")
         return
 
-def criar_icone():
-    # Ícone: quadrado azul com círculo branco no centro (32x32)
-    img = Image.new('RGBA', (32, 32), "blue")
+    to_save = merge_by_message_id(pending_rows, dados_novos)
+    if not to_save:
+        logger.info("Nada a gravar após mesclar pendências.")
+        return
+
+    excel = ExcelManager(spreadsheet_path)
+    try:
+        excel.salvar_chamados(to_save)
+    except ArquivoBloqueadoError as e:
+        logger.warning("Não foi possível salvar — arquivo em uso: %s", e)
+        notify_excel_blocked(
+            str(spreadsheet_path),
+            float(notif.get("blocked_debounce_minutes", 10)),
+            bool(notif.get("enabled", True)),
+        )
+        save_pending(pending_path, to_save)
+        return
+    except ExcelReadError as e:
+        logger.error("%s", e)
+        return
+    except Exception as e:
+        logger.error("Erro ao salvar chamados: %s", e)
+        return
+
+    clear_pending(pending_path)
+    dt_cursor = max_data_chegada(to_save)
+    if dt_cursor is None:
+        logger.warning("Sem datas em 'Data Chegada'; watermark não atualizado.")
+        return
+
+    write_watermark(str(state_path), dt_cursor)
+    logger.info(
+        "Sincronização finalizada: %s linha(s) gravada(s); watermark atualizado.",
+        len(to_save),
+    )
+
+
+def _sync_worker(cfg: dict) -> None:
+    """Um único thread: COM inicializado aqui (Outlook via pywin32)."""
+    import pythoncom
+
+    pythoncom.CoInitialize()
+    try:
+        interval_min = float(cfg["sync"]["interval_minutes"])
+        interval_sec = max(interval_min * 60.0, 1.0)
+        while True:
+            try:
+                _run_sync_cycle(cfg)
+            except Exception as e:
+                logger.exception("Erro na rotina de sincronização: %s", e)
+            ev = _manual_sync
+            if ev is None:
+                break
+            triggered = ev.wait(timeout=interval_sec)
+            if triggered:
+                ev.clear()
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def criar_icone_ok() -> Image.Image:
+    img = Image.new("RGBA", (32, 32), "blue")
     draw = ImageDraw.Draw(img)
     draw.ellipse((8, 8, 24, 24), fill="white")
     return img
 
-def thread_da_sincronizacao():
-    logger.info("Thread de sincronização automática iniciada (background).")
-    while True:
-        try:
-            rotina_sincronizacao()
-        except Exception as e:
-            logger.error(f"Erro na rotina sincronizada: {e}")
-        time.sleep(INTERVALO_MINUTOS * 1)
 
-def acao_sincronizar_manual(icon, item):
-    logger.info("Sincronização manual acionada pelo usuário.")
-    thread = threading.Thread(target=rotina_sincronizacao)
-    thread.daemon = True
-    thread.start()
+def acao_sincronizar_manual(icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+    logger.info("Sincronização manual acionada pelo menu.")
+    if _manual_sync is not None:
+        _manual_sync.set()
 
-def acao_sair(icon, item):
-    logger.info("Sistema de Ouvidoria finalizando pelo menu do usuário.")
+
+def acao_sair(icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+    logger.info("Encerrando pelo menu da bandeja.")
     icon.stop()
 
-def main():
-    # Inicia thread de background
-    t = threading.Thread(target=thread_da_sincronizacao, daemon=True)
-    t.start()
 
-    # Cria e configura pystray Icon
+def main() -> None:
+    global _manual_sync
+
+    cfg = load_config()
+    _manual_sync = threading.Event()
+
+    worker = threading.Thread(target=_sync_worker, args=(cfg,), daemon=True)
+    worker.start()
+
     menu = (
-        item("Sincronizar Agora", acao_sincronizar_manual),
-        item("Sair", acao_sair)
+        item("Sincronizar agora", acao_sincronizar_manual),
+        item("Sair", acao_sair),
     )
-    icone = pystray.Icon("OuvidoriaBot", criar_icone(), "Outlook Manager Robot - Ativo", menu=menu)
-    logger.info("Sistema da Ouvidoria carregado. O ícone foi iniciado na bandeja do sistema.")
+    icone = pystray.Icon(
+        "OuvidoriaBot",
+        criar_icone_ok(),
+        "Outlook Manager — Ouvidoria (ativo)",
+        menu=menu,
+    )
+    logger.info(
+        "Sistema carregado (intervalo %s min). Ícone na bandeja.",
+        cfg["sync"]["interval_minutes"],
+    )
     icone.run()
+
 
 if __name__ == "__main__":
     main()
